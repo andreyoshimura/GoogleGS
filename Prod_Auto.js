@@ -1,36 +1,36 @@
 /**
  * ============================================================
- * Prod_Auto.gs — MODO PRODUÇÃO AUTOMÁTICO (VERSÃO FINAL)
+ * Prod_Auto.gs — MODO PRODUÇÃO AUTOMÁTICO (CORRIGIDO)
  * ============================================================
  *
- * Pipeline AUTOMÁTICO e IDÊMPOTENTE:
+ * Correções aplicadas:
+ * 1) Remove duplicidade de executarModoProducao (era a causa do erro "function not found")
+ * 2) LockService (evita execuções concorrentes por gatilho/manual)
+ * 3) Chamada do gerador via globalThis (mais estável em gatilhos)
+ * 4) Fecha chaves/escopo e garante flush no final
  *
- * 1) Lê o ÚLTIMO sorteio diretamente da aba "Resultados"
- * 2) Registra acertos em "Resultados_Jogos"
- * 3) Executa aprendizado (backtest fiel, janela 50)
- *    - com trava de regressão (rollback automático)
- * 4) Gera novos jogos com gerarJogosAgressivo()
- *
- * NÃO depende de preenchimento manual.
- * Compatível com gatilho diário.
+ * Observação operacional:
+ * - Depois de colar, APAGUE e RECRIE o gatilho apontando para executarModoProducao.
  */
-
-/**
- * ============================================================
- * ABAS VERDE
- * ============================================================
- *
- * "Resultados" -> Leitura
- * "Resultados_Jogos" Escrita
- * "Conif"Faz SnapShot
- */
-
-
-/* =========================================================
-   FUNÇÃO PRINCIPAL (USE ESTA)
-   ========================================================= */
 
 function executarModoProducao() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(25000)) {
+    throw new Error("Execução concorrente detectada (lock).");
+  }
+
+  try {
+    executarModoProducaoCore_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* =========================================================
+   PIPELINE REAL (NÃO ATELE O GATILHO A ESTA)
+   ========================================================= */
+
+function executarModoProducaoCore_() {
   const ss = SpreadsheetApp.getActive();
 
   const GENERATOR_FN = "gerarJogosAgressivo";
@@ -77,13 +77,16 @@ function executarModoProducao() {
   // 5) Trava de regressão
   // --------------------------------------------------------
   const last = getLastBestScoreRow_(ss);
-  if (!last) throw new Error("Não foi possível ler best_score no Config_Historico.");
+  if (!last) {
+    throw new Error("Não foi possível ler best_score no Config_Historico.");
+  }
 
   if (baseline !== null) {
     const drop = baseline - last.bestScore;
     if (drop > GUARD.MAX_DROP) {
       restoreConfigSnapshot_(ss, cfgBefore);
-      markLastRowReverted_(ss,
+      markLastRowReverted_(
+        ss,
         `REVERTED | DROP=${drop.toFixed(2)} | BASE=${baseline.toFixed(2)}`
       );
       throw new Error(
@@ -95,14 +98,13 @@ function executarModoProducao() {
   // --------------------------------------------------------
   // 6) Gerar novos jogos (produção)
   // --------------------------------------------------------
-  if (typeof this[GENERATOR_FN] !== "function") {
+  if (typeof globalThis[GENERATOR_FN] !== "function") {
     throw new Error(`Gerador "${GENERATOR_FN}" não encontrado.`);
   }
-  this[GENERATOR_FN]();
+  globalThis[GENERATOR_FN]();
 
   SpreadsheetApp.flush();
 }
-
 
 /* =========================================================
    LEITURA DO ÚLTIMO SORTEIO (Resultados)
@@ -123,7 +125,8 @@ function getLastDrawFromResultados_(ss) {
   const row = sh.getRange(lr, 1, 1, 17).getValues()[0];
   const concurso = String(row[0] ?? "").trim();
 
-  const dezenas = row.slice(2)
+  const dezenas = row
+    .slice(2)
     .map(Number)
     .filter(n => n >= 1 && n <= 25);
 
@@ -132,7 +135,6 @@ function getLastDrawFromResultados_(ss) {
 
   return { concurso, dezenas: uniq };
 }
-
 
 /* =========================================================
    BASELINE / BEST SCORE (Config_Historico)
@@ -145,14 +147,17 @@ function getBaselineBestScore_(ss, n) {
   const lr = sh.getLastRow();
   if (lr < 2) return null;
 
-  const header = sh.getRange(1, 1, 1, sh.getLastColumn())
-    .getDisplayValues()[0].map(s => String(s).trim());
+  const header = sh
+    .getRange(1, 1, 1, sh.getLastColumn())
+    .getDisplayValues()[0]
+    .map(s => String(s).trim());
 
   const col = findBestScoreCol_(header);
   if (col < 1) return null;
 
   const start = Math.max(2, lr - n + 1);
-  const vals = sh.getRange(start, col, lr - start + 1, 1)
+  const vals = sh
+    .getRange(start, col, lr - start + 1, 1)
     .getValues()
     .map(r => Number(String(r[0]).replace(",", ".")))
     .filter(v => Number.isFinite(v));
@@ -168,8 +173,10 @@ function getLastBestScoreRow_(ss) {
   const lr = sh.getLastRow();
   if (lr < 2) return null;
 
-  const header = sh.getRange(1, 1, 1, sh.getLastColumn())
-    .getDisplayValues()[0].map(s => String(s).trim());
+  const header = sh
+    .getRange(1, 1, 1, sh.getLastColumn())
+    .getDisplayValues()[0]
+    .map(s => String(s).trim());
 
   const col = findBestScoreCol_(header);
   if (col < 1) return null;
@@ -194,7 +201,6 @@ function findBestScoreCol_(header) {
   return -1;
 }
 
-
 /* =========================================================
    SNAPSHOT / ROLLBACK CONFIG
    ========================================================= */
@@ -208,7 +214,9 @@ function loadConfigSnapshot_(ss) {
 
   const rows = sh.getRange(2, 1, lr - 1, 2).getValues();
   const snap = {};
-  rows.forEach(([k, v]) => { if (k) snap[String(k).trim()] = v; });
+  rows.forEach(([k, v]) => {
+    if (k) snap[String(k).trim()] = v;
+  });
   return snap;
 }
 
@@ -217,17 +225,23 @@ function restoreConfigSnapshot_(ss, snap) {
   if (!sh) throw new Error('Aba "Config" não encontrada.');
 
   const lr = sh.getLastRow();
+  if (lr < 2) throw new Error('Aba "Config" vazia.');
+
   const rows = sh.getRange(2, 1, lr - 1, 2).getValues();
   const idx = new Map();
-  rows.forEach((r, i) => { if (r[0]) idx.set(String(r[0]).trim(), i + 2); });
+  rows.forEach((r, i) => {
+    if (r[0]) idx.set(String(r[0]).trim(), i + 2);
+  });
 
   Object.keys(snap).forEach(k => {
     const r = idx.get(k);
-    if (r) sh.getRange(r, 2).setValue(snap[k]);
-    else sh.getRange(sh.getLastRow() + 1, 1, 1, 2).setValues([[k, snap[k]]]);
+    if (r) {
+      sh.getRange(r, 2).setValue(snap[k]);
+    } else {
+      sh.getRange(sh.getLastRow() + 1, 1, 1, 2).setValues([[k, snap[k]]]);
+    }
   });
 }
-
 
 /* =========================================================
    HISTÓRICO — MARCAR ROLLBACK
@@ -237,8 +251,10 @@ function markLastRowReverted_(ss, text) {
   const sh = ss.getSheetByName("Config_Historico");
   if (!sh) return;
 
-  const header = sh.getRange(1, 1, 1, sh.getLastColumn())
-    .getDisplayValues()[0].map(s => String(s).trim());
+  const header = sh
+    .getRange(1, 1, 1, sh.getLastColumn())
+    .getDisplayValues()[0]
+    .map(s => String(s).trim());
 
   const idx = header.findIndex(h => h === "modo");
   if (idx < 0) return;

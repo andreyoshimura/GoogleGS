@@ -22,6 +22,7 @@
  *
  * "Resultados" -> Leitura
  * "Resultados_Jogos" Escrita
+ * "Conif"Faz SnapShot
  */
 
 
